@@ -1,0 +1,5 @@
+tenantSlug: stirrup
+renderPath: k8s
+ingressHost: stirrup.reeves.racing
+targetArch: arm64
+ingressClass: nginx

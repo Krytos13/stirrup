@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stirrup-splash
+  labels:
+    app.kubernetes.io/name: stirrup-splash
+    app.kubernetes.io/part-of: stirrup
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - stirrup.reeves.racing
+      secretName: stirrup-splash-tls
+  rules:
+    - host: stirrup.reeves.racing
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: stirrup-splash
+                port:
+                  number: 80
