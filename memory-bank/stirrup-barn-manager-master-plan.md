@@ -1,8 +1,8 @@
 # Stirrup Barn Manager — Master Implementation Plan
 
-**Version:** 1.0  
-**Repo:** [stirrup](https://github.com/Krytos13/stirrup)  
-**Platform:** [k3s-homelab-platform](https://github.com/Krytos13/k3s-homelab-platform) tenant GitOps  
+**Version:** 1.1  
+**Repo:** [stirrup](https://github.com/Krytos13/stirrup) (CI/registry: GitLab `registry.reeves.racing`)  
+**Platform:** [k3s-homelab-platform](https://gitlab.reeves.racing/homelab/k3s-homelab-platform) tenant GitOps  
 **Mini-plan index:** [plans.md](plans.md)
 
 ---
@@ -15,6 +15,9 @@ Stirrup is a barn management mobile app whose non-negotiable feature is **Care-t
 - **Mobile:** Expo/React Native (EAS internal builds)
 - **Billing:** Internal ledger + monthly statement PDFs (no Stripe/QB)
 - **Runtime:** API + PostgreSQL in homelab tenant namespace `stirrup`
+- **Connectivity:** Cloudflare Tunnel (free) → nginx-ingress; WAN port-forward as fallback
+- **Edge auth:** App-level JWT on `/api`; no oauth2-proxy on tenant Ingress
+- **Postgres storage:** Ceph RBD `rook-ceph-block-retain` (platform StorageClass)
 
 **Critical path:** Phase 0 → Phase 1 schema → Phase 2 Care-to-Cash API proof → Phase 3 offline mobile → Phases 4–6 billing completeness → Phase 7 hardening (parallel after Phase 0).
 
@@ -64,11 +67,22 @@ flowchart TB
     Sync[Sync Engine]
   end
 
+  subgraph edge [Cloudflare Edge]
+    CFdns[Public DNS proxied]
+    CFwaf[WAF rate limits]
+    CFtls[Universal SSL]
+  end
+
+  subgraph platformEdge [Platform Edge Namespace]
+    Cfd[cloudflared Deployment]
+    Nginx[nginx-ingress LoadBalancer]
+  end
+
   subgraph cluster [K8s Namespace stirrup]
-    Ingress[nginx Ingress TLS]
+    Ingress[Ingress stirrup.reeves.racing]
     API[stirrup-api Deployment]
     PDF[Statement PDF Job]
-    PG[(PostgreSQL StatefulSet)]
+    PG[(PostgreSQL on rook-ceph-block-retain)]
     ESO[ExternalSecret from Vault]
   end
 
@@ -76,21 +90,57 @@ flowchart TB
     GitLab[GitLab CI tenant-image]
     Argo[Argo CD Application]
     Vault[Vault kv/homelab/tenants/stirrup]
-    Grafana[Grafana Loki Prometheus]
+    Ceph[Rook Ceph RBD pool replicapool]
   end
 
   QR --> Tasks
   Tasks --> OfflineDB
   OfflineDB --> Sync
-  Sync -->|HTTPS| Ingress
-  Ingress --> API
+  Sync -->|HTTPS Bearer JWT| CFdns
+  CFdns --> CFwaf --> CFtls
+  CFtls <-->|outbound tunnel| Cfd
+  Cfd --> Nginx
+  Nginx --> Ingress
+  Ingress -->|no oauth2-proxy| API
   API --> PG
   API --> PDF
+  PG --> Ceph
   ESO --> API
   GitLab --> API
   Argo --> cluster
   Vault --> ESO
 ```
+
+### Mobile to cluster connectivity
+
+Staff phones reach the API over the public internet via **Cloudflare Tunnel** (free tier). The mobile app never talks to Kubernetes directly — only HTTPS to `https://stirrup.reeves.racing/api` with `Authorization: Bearer <JWT>`.
+
+```mermaid
+flowchart LR
+  Phone["Expo app LTE or any net"] -->|"proxied CNAME"| CFedge["Cloudflare edge WAF Universal SSL"]
+  CFedge <-->|"outbound tunnel"| Cfd["cloudflared in-cluster"]
+  Cfd -->|"host route"| Nginx["nginx-ingress"]
+  Nginx -->|"no auth-url on tenant Ingress"| API["stirrup-api JWT auth"]
+  API -->|"5432 platform netpol egress"| PG[("Postgres rook-ceph-block-retain")]
+```
+
+| Layer | Responsibility |
+|-------|----------------|
+| **Mobile** | Offline outbox; sync batch POST `/sync`; JWT in Expo SecureStore |
+| **Cloudflare** | Public DNS, proxied orange-cloud, WAF, rate limits, Universal SSL at edge |
+| **cloudflared** | Outbound tunnel to nginx-ingress; no inbound port-forward required |
+| **nginx-ingress** | Host routing `stirrup.reeves.racing` → stirrup-api Service; ssl-redirect; per-Ingress rate limits |
+| **Tenant Ingress** | TLS annotation; **must not** include `auth-url` / `auth-signin` (oauth2-proxy is admin-only) |
+| **stirrup-api** | JWT access 15m + refresh 30d; coverage engine; ledger writes |
+| **PostgreSQL** | Single-replica StatefulSet; RWO PVC on `rook-ceph-block-retain` |
+
+**Tunnel wiring (platform operator):** Deploy `cloudflared` in the edge AppProject; store tunnel credentials in Vault + ESO; configure a public hostname route `stirrup.reeves.racing` → `ingress-nginx-controller` Service (port 443 or 80). Existing per-host Ingress rules continue to apply — the tunnel terminates at nginx, not at stirrup-api directly.
+
+**TLS (D-19):** Edge TLS = Cloudflare Universal SSL (client → Cloudflare). Origin traffic through the tunnel is encrypted by cloudflared. If WAN fallback is used instead, use `letsencrypt-prod-dns01` ClusterIssuer (Cloudflare DNS-01) on the tenant Ingress.
+
+**WAN fallback:** Residential port-forward tcp/80+443 → MetalLB VIP `192.168.1.15` remains documented in `platform/deploy/internet-edge-and-tenants.md`. Use only if Cloudflare Tunnel is unavailable. Requires public Cloudflare A record and DDNS for dynamic home IP.
+
+**oauth2-proxy isolation (D-18):** Platform oauth2-proxy gates admin surfaces (Argo, Headlamp, k3s-onboarding) via opt-in Ingress annotations. The tenant template ships **without** `auth-url`. **Never copy** the k3s-onboarding Ingress pattern onto stirrup — it gates `/api` with browser Google SSO and breaks native mobile clients (302 → Google).
 
 ### Care-to-Cash sequence
 
@@ -129,13 +179,14 @@ stirrup/
 │   ├── kustomization.yaml
 │   ├── api-deployment.yaml
 │   ├── api-service.yaml
-│   ├── postgres-statefulset.yaml
+│   ├── postgres-statefulset.yaml   # storageClassName: rook-ceph-block-retain
 │   ├── postgres-service.yaml
-│   ├── ingress.yaml
+│   ├── ingress.yaml                # no oauth2-proxy auth-url annotations
 │   ├── externalsecret-api.yaml
 │   ├── externalsecret-postgres.yaml
-│   ├── networkpolicy.yaml
-│   └── cronjob-statements.yaml
+│   ├── externalsecret-registry.yaml  # imagePullSecrets for GitLab registry
+│   └── cronjob-pgdump.yaml           # logical backup; start Phase 0
+│   # NetworkPolicy is platform-owned — lives in tenants/bundles/stirrup/ (operator MR)
 ├── scripts/
 │   ├── render-manifests.sh
 │   └── migrate.sh
@@ -156,6 +207,143 @@ targetArch: arm64
 ingressClass: nginx
 ```
 
+### Postgres PVC and securityContext (D-20)
+
+Platform operator adds StorageClass `rook-ceph-block-retain` (clone of `rook-ceph-block` with `reclaimPolicy: Retain`). Tenant Postgres StatefulSet pins it explicitly — cluster default is `local-path`, which must **not** be used for ledger data.
+
+```yaml
+# volumeClaimTemplate (postgres-statefulset.yaml)
+storageClassName: rook-ceph-block-retain
+resources:
+  requests:
+    storage: 5Gi
+```
+
+```yaml
+# pod securityContext (postgres-statefulset.yaml) — baseline + restricted-ready
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 999          # official postgres image UID
+  fsGroup: 999            # ext4 volume ownership on rook-ceph-block
+  seccompProfile:
+    type: RuntimeDefault
+containers:
+  - name: postgres
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits:   { cpu: 500m, memory: 512Mi }
+```
+
+Ceph pool `replicapool`: 3× replication, `failureDomain: host` — survives loss of one Pi node. PVC delete retains RBD image (`Retain` policy); accidental namespace delete still requires operator recovery from retained volume.
+
+---
+
+## Platform integration contract
+
+Verified against `k3s-homelab-platform` as of 2026-06. Stirrup implementation must align with these constraints.
+
+### Registry and CI
+
+| Item | Value |
+|------|-------|
+| Canonical registry | `registry.reeves.racing` (GitLab Container Registry) |
+| GHCR | Retired 2026-06-01 — do not use |
+| CI jobs | `tenant-guardrails`, `repo-hygiene`, `tenant-image` via platform `includes/` |
+| Image pull | Tenant manifests need `imagePullSecrets: registry-credentials` via ESO (template ships none) |
+| Target arch | `arm64` (`homelab-tenant.yaml` `targetArch`) |
+
+### Vault and ExternalSecrets
+
+| Item | Value |
+|------|-------|
+| KV path | `kv/homelab/tenants/stirrup/<secret-name>` |
+| ESO `remoteRef.key` | `homelab/tenants/stirrup/<secret-name>` (no `kv/` prefix) |
+| Tenant SecretStore | `vault-tenant` (namespace-scoped; auth via `vault-eso-read-token`) |
+| Platform ClusterSecretStore | `vault-backend` |
+| Enable at grant | `VAULT_TENANT_ESO_ENABLED=true` on k3s-onboarding grant |
+
+Expected secrets: `homelab/tenants/stirrup/api` (JWT signing key, etc.), `homelab/tenants/stirrup/postgres` (DB creds), registry pull creds if not platform-injected.
+
+### Namespace policy — medium tier (default)
+
+Source: `tenants/templates/namespace-policy/tiers/medium.resourcequota.yaml`
+
+| Quota key | Value |
+|-----------|-------|
+| `requests.cpu` | 2 |
+| `requests.memory` | 512Mi |
+| `limits.cpu` | 4 |
+| `limits.memory` | 1Gi |
+| `persistentvolumeclaims` | 4 |
+| `pods` | 20 |
+| `services` | 10 |
+| `secrets` | 20 |
+| `configmaps` | 30 |
+
+No storage-size quota — only PVC count. LimitRange defaults: 500m/512Mi limit, 100m/128Mi request per container; pod max 4 CPU / 4Gi.
+
+**Budget implication:** API + Postgres + migration Job + PDF Job must fit **512Mi requests / 1Gi limits aggregate**. Size Postgres `shared_buffers` and API heap accordingly.
+
+### PSA and labels
+
+| Item | Value |
+|------|-------|
+| PSA level | `baseline` (onboarding adds `stirrup,baseline` to `psa-namespaces.csv`) |
+| Required label | `app.kubernetes.io/part-of: stirrup` on all pods (NetworkPolicy selector) |
+| Restricted | Not default; Postgres securityContext above is restricted-ready if promoted later |
+
+### NetworkPolicy (platform-owned)
+
+Tenants **cannot** create NetworkPolicy (AppProject blacklist + `deny-risky-manifests.rego`). Baseline bundle policy is default-deny but **lacks egress to port 5432** — API → Postgres is blocked until operator MR adds a rule in `tenants/bundles/stirrup/networkpolicy.yaml`:
+
+```yaml
+# egress addition (operator MR example)
+- to:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: stirrup-postgres
+  ports:
+    - protocol: TCP
+      port: 5432
+```
+
+Ingress from nginx works via `10.42.0.0/16` (pod CIDR) already allowed in baseline.
+
+### Storage
+
+| Item | Value |
+|------|-------|
+| Cluster default SC | `local-path` — **do not use for Postgres** |
+| Postgres SC | `rook-ceph-block-retain` (operator creates; RBD RWO, Retain, expandable) |
+| Ceph pool | `replicapool`, replicated size 3, failureDomain host |
+| Usable cluster capacity | ~830 GiB at 3× replication (~2.5 TiB raw) |
+
+### Onboarding grant flow
+
+1. Operator submits **grant** via k3s-onboarding → `OnboardingJob` CR.
+2. Worker opens platform GitLab MR: `tenants/bundles/stirrup/` + PSA CSV row + Argo RBAC.
+3. Optional tenant repo MR (`seedTenantRepo: true`; use `guardrails-only` for existing app repo).
+4. ApplicationSet `tenant-installs` → `stirrup-install` → `Application/stirrup` syncs repo `k8s/`.
+
+Recommended grant parameters:
+
+```
+namespace: stirrup
+namespacePolicyTier: medium
+createNamespaceIfMissing: true
+ingressDomain: reeves.racing
+repoPath: k8s
+tenantSeedMode: guardrails-only
+seedTenantRepo: true
+VAULT_TENANT_ESO_ENABLED: true
+```
+
+DNS: Cloudflare proxied CNAME `stirrup.reeves.racing` → tunnel hostname; Pi-hole split-horizon `stirrup.reeves.racing` → `192.168.1.15` for LAN clients.
+
 ---
 
 ## Decision log
@@ -164,10 +352,10 @@ Resolve items by the **decide-by** phase before starting dependent mini-plans.
 
 | ID | Decision | Options | Decide by | Status | Notes |
 |----|----------|---------|-----------|--------|-------|
-| D-01 | Canonical registry | GitLab `registry.reeves.racing` vs GHCR | Phase 0 | **open** | History used GHCR; platform expects GitLab |
+| D-01 | Canonical registry | GitLab `registry.reeves.racing` vs GHCR | Phase 0 | **resolved** | GitLab canonical; GHCR retired 2026-06-01 |
 | D-02 | API framework | Fastify vs Hono | Phase 0 | open | Lean toward Fastify for ecosystem |
 | D-03 | DB access + migrations | Drizzle vs Flyway | Phase 0 | open | Drizzle fits TS monorepo |
-| D-04 | Phone → API connectivity | LAN-only vs Tailscale vs WAN | Phase 0 | open | LTE staff need path to API |
+| D-04 | Phone → API connectivity | Cloudflare Tunnel vs WAN vs Tailscale | Phase 0 | **resolved** | Cloudflare Tunnel primary (free); WAN port-forward fallback |
 | D-05 | Billing account model | Client-only vs Client + BillingAccount | Phase 1 | open | Leases/part-owners need clarity |
 | D-06 | Board package shape | Flat fee + included SKUs vs tiers | Phase 1 | open | Drives coverage engine |
 | D-07 | Price at charge time | Snapshot on ChargeLine vs live catalog | Phase 1 | **recommend snapshot** | Prevents retroactive invoice drift |
@@ -180,7 +368,12 @@ Resolve items by the **decide-by** phase before starting dependent mini-plans.
 | D-14 | Charge line statuses | pending → on_statement → finalized | Phase 2 | open | Enum early; void/credit later |
 | D-15 | Proration policy | Calendar month vs 30-day | Phase 5 | open | Store `billing_policy` on Barn in Phase 1 |
 | D-16 | Split penny rounding | Largest remainder vs last horse absorbs | Phase 4 | open | Test fixtures required |
-| D-17 | PDF generation location | In API pod vs K8s Job | Phase 6 | open | Job safer on medium quota |
+| D-17 | PDF generation location | In API pod vs K8s Job | Phase 6 | open | Job safer on medium quota; see D-21 engine |
+| D-18 | Edge auth isolation | oauth2-proxy on Ingress vs JWT-only API | Phase 0 | **resolved** | No `auth-url` on tenant Ingress; JWT in API (MP-1.2) |
+| D-19 | Edge TLS with Tunnel | Cloudflare Universal SSL vs origin LE | Phase 0 | **resolved** | Universal SSL at edge; `letsencrypt-prod-dns01` if WAN fallback |
+| D-20 | Postgres storage class | local-path vs rook-ceph-block vs rook-ceph-block-retain | Phase 0 | **resolved** | `rook-ceph-block-retain` (RBD RWO Retain) + early pg_dump |
+| D-21 | PDF engine | Headless Chromium vs lightweight lib | Phase 6 | **resolved** | pdf-lib or pdfkit in Job; Chromium OOM under 1Gi quota |
+| D-22 | Source-of-record repo host | GitHub vs GitLab | Phase 0 | open | CI/registry on GitLab; recommend GitLab canonical for stirrup repo |
 
 ---
 
@@ -190,14 +383,14 @@ How much can wait until the phase or mini-plan is actively worked.
 
 | Phase | ~% deferrable | Safe to defer | Do not defer |
 |-------|---------------|---------------|--------------|
-| **0** | 70% ops | NetworkPolicy, backups, Grafana dashboards, PDF CronJob | Registry, arm64 CI, Vault ESO, Postgres PVC, healthz, CI kit |
+| **0** | 55% ops | Grafana dashboards, PDF statement CronJob, full observability | Registry GitLab, arm64 CI, Vault ESO, Cloudflare Tunnel MP-0.10, platform netpol 5432 MP-0.11, retain SC MP-0.12, Postgres on rook-ceph-block-retain, pg_dump CronJob, healthz, CI kit, imagePullSecret |
 | **1** | 40% | Seed polish, OIDC, mobile admin UI, full OpenAPI | Horse/Client/Stall/Service/BoardPackage/CareEvent/ChargeLine tables; roles; audit log; price snapshot; `billing_policy` field |
 | **2** | 25% | Cron task scheduler, waiver UI, statement preview endpoint | Coverage engine, care→charge pipeline, idempotency, quick charge, coverage_audit |
 | **3** | 50% UX | UI polish, EAS production, background sync tuning | Outbox, sync ack, QR→stall context, SecureStore tokens |
 | **4** | 80% | Custom %, attendance splits, receipt upload | Equal split + atomic multi ChargeLine |
 | **5** | 90%* | Deposit refund UI, auto proration triggers | `effective_range` on BoardPackage (*0% if frequent move-ins) |
-| **6** | 60% | Email, reminders, fancy PDF, client portal | `statement_id` FK; finalize lock; basic PDF totals |
-| **7** | 95% | Full observability stack | `/readyz` + one backup test before pilot with real data |
+| **6** | 60% | Email, reminders, fancy PDF layout, client portal | `statement_id` FK; finalize lock; basic PDF totals (pdf-lib Job per D-21) |
+| **7** | 90% | Full observability stack, PSA restricted promotion | `/readyz` + backup restore test; Cloudflare WAF tuning |
 | **8** | 100% | All listed nice-to-haves | — |
 
 ---
@@ -209,11 +402,16 @@ How much can wait until the phase or mini-plan is actively worked.
 | # | Pitfall | Mitigation | Phase |
 |---|---------|------------|-------|
 | P-01 | Empty repo + stale cluster splash resources | Reconcile Argo app; delete orphan splash deployment | 0 |
-| P-02 | GHCR vs GitLab registry mismatch | Lock D-01 before first image push | 0 |
-| P-03 | Medium quota OOM (512Mi–1Gi) | Explicit requests/limits; small Postgres shared_buffers | 0, 7 |
+| P-02 | GHCR vs GitLab registry mismatch | **Resolved:** D-01 GitLab `registry.reeves.racing` only | 0 |
+| P-03 | Medium quota OOM (512Mi–1Gi) | Explicit requests/limits; small Postgres shared_buffers; lightweight PDF (D-21) | 0, 6, 7 |
 | P-04 | API/Postgres start without ESO secrets | Gate deploy on SecretSynced | 0 |
 | P-05 | amd64 images on arm64 Pi nodes | buildx arm64 in CI from day one | 0 |
-| P-06 | Phones on LTE cannot resolve Pi-hole DNS | Resolve D-04 (Tailscale etc.) | 0, 3 |
+| P-06 | Phones on LTE cannot reach API | **Resolved:** D-04 Cloudflare Tunnel public hostname; Pi-hole not required off-LAN | 0, 3 |
+| P-24 | oauth2-proxy on `/api` Ingress | Never add `auth-url`; D-18 JWT-only; do not copy k3s-onboarding ingress | 0, 1 |
+| P-25 | API→Postgres blocked by default netpol | Operator MR: 5432 egress in `tenants/bundles/stirrup/networkpolicy.yaml` (MP-0.11) | 0 |
+| P-26 | Postgres on local-path loses data on node move | Pin `storageClassName: rook-ceph-block-retain` (D-20) | 0 |
+| P-27 | Home internet/power outage blocks sync | Offline outbox survives; set pilot uptime expectations; Tunnel resilient to IP change | 0, 3 |
+| P-30 | cloudflared not yet deployed | MP-0.10 platform edge app; tunnel creds in Vault/ESO | 0 |
 
 ### Domain and Care-to-Cash
 
@@ -234,6 +432,7 @@ How much can wait until the phase or mini-plan is actively worked.
 | P-14 | Horse moved stalls; QR on door | Resolve current horse by stall_id at read time | 3 |
 | P-15 | Full ERD mirrored in SQLite | Minimal cache + outbox only | 3 |
 | P-16 | EAS provisioning overhead | Budget Apple/Google setup in MP-3.4 | 3 |
+| P-29 | JWT refresh expires during long offline | 30d refresh token; outbox queues care events; re-auth banner on reconnect | 3 |
 
 ### Billing extensions
 
@@ -242,7 +441,8 @@ How much can wait until the phase or mini-plan is actively worked.
 | P-17 | Split rounding ≠ total | D-16 penny algorithm + tests | 4 |
 | P-18 | Proration edge cases (Feb, 31st) | MP-5.1 exhaustive fixtures | 5 |
 | P-19 | Finalize without void path | Credit note status enum early | 6 |
-| P-20 | PDF OOM in API pod | D-17 separate Job | 6 |
+| P-20 | PDF OOM in API pod | D-17 separate Job; D-21 pdf-lib/pdfkit not Chromium (P-28) | 6 |
+| P-28 | Headless Chromium PDF Job OOM | Lightweight PDF lib; cap Job memory 256Mi | 6 |
 
 ### Process
 
@@ -256,23 +456,29 @@ How much can wait until the phase or mini-plan is actively worked.
 
 ## Phase 0 — Foundation and cluster footing
 
-**Goal:** CI green, API placeholder at `https://stirrup.reeves.racing/healthz`, Postgres PVC bound.
+**Goal:** CI green, API placeholder at `https://stirrup.reeves.racing/healthz` (via Cloudflare Tunnel), Postgres PVC bound on `rook-ceph-block-retain`, pg_dump CronJob scheduled.
 
 | Step | Action | Mini-plan | Acceptance |
 |------|--------|-----------|------------|
 | 0.1 | Re-seed from `k3s-homelab-platform/tenants/templates/repo-ci` + k8s API manifests | MP-0.1 | `tenant-guardrails` + `repo-hygiene` green |
-| 0.2 | Confirm `tenants/bundles/stirrup/` or re-grant via k3s-onboarding | MP-0.2 | Argo `Application/stirrup` Synced |
-| 0.3 | Pi-hole: `stirrup.reeves.racing` → `192.168.1.15` | MP-0.3 | Hostname resolves on LAN |
-| 0.4 | Vault: `homelab/tenants/stirrup/api`, `.../postgres` | MP-0.4 | ExternalSecret SecretSynced |
+| 0.2 | Grant/reconcile `tenants/bundles/stirrup/` via k3s-onboarding (`VAULT_TENANT_ESO_ENABLED=true`) | MP-0.2 | Argo `Application/stirrup` Synced |
+| 0.3 | Cloudflare proxied CNAME `stirrup.reeves.racing` → tunnel; Pi-hole split-horizon → `192.168.1.15` | MP-0.3 | Hostname resolves LAN + LTE |
+| 0.4 | Vault: `homelab/tenants/stirrup/api`, `.../postgres`; ESO SecretSynced | MP-0.4 | ExternalSecret SecretSynced |
 | 0.5 | pnpm monorepo; API returns `{ status: "ok" }` | MP-0.5 | `pnpm test` in CI |
-| 0.6 | Multi-stage Dockerfile arm64; tenant-image push | MP-0.6 | Cluster pulls image |
-| 0.7 | PostgreSQL StatefulSet + migration job | MP-0.7 | `\dt` shows migrations |
-| 0.8 | Ingress `/api/*` → API; TLS | MP-0.8 | `curl /healthz` 200 |
+| 0.6 | Multi-stage Dockerfile arm64; push to `registry.reeves.racing`; imagePullSecret via ESO | MP-0.6 | Cluster pulls image |
+| 0.7 | PostgreSQL StatefulSet on `rook-ceph-block-retain` (5Gi) + migration job | MP-0.7 | `\dt` shows migrations |
+| 0.8 | Ingress `/api/*` → API; **no oauth2-proxy annotations**; verify Tunnel path | MP-0.8 | `curl /healthz` 200 from LTE |
 | 0.9 | memory-bank/ | MP-0.9 | complete |
+| 0.10 | Deploy cloudflared in platform edge; tunnel route → nginx-ingress | MP-0.10 | Tunnel healthy; public hostname routes |
+| 0.11 | Platform MR: netpol egress 5432 API→Postgres in bundle | MP-0.11 | API `/readyz` DB ping OK |
+| 0.12 | Platform MR: StorageClass `rook-ceph-block-retain` | MP-0.12 | SC available; PVC Bound Retain |
+| 0.13 | pg_dump CronJob + registry ExternalSecret | MP-0.13 | CronJob succeeds; dump artifact exists |
 
-**Resource budget:** medium tier — 1 Postgres PVC (~2Gi), API 1 replica, defer PDF CronJob.
+**Resource budget:** medium tier — Postgres PVC 5Gi on Ceph retain, API 1 replica (~128Mi request), pg_dump CronJob; defer statement PDF CronJob to Phase 6.
 
-**Parallel:** MP-0.9 done. MP-7.1/7.2 can wait.
+**Parallel:** MP-0.9 done. MP-0.10 can start once edge AppProject accepts cloudflared. MP-7.1 observability can wait.
+
+**Operator-only (platform repo):** MP-0.10, MP-0.11, MP-0.12 — not in stirrup tenant Git.
 
 ---
 
@@ -444,7 +650,7 @@ apps/mobile/src/
 | Step | Detail |
 |------|--------|
 | 3.4.1 | `eas.json`: development, preview, production |
-| 3.4.2 | API URL: `https://stirrup.reeves.racing/api` (or Tailscale host per D-04) |
+| 3.4.2 | API URL: `https://stirrup.reeves.racing/api` via Cloudflare Tunnel (D-04); LAN dev may use split-horizon |
 | 3.4.3 | Internal TestFlight / Play internal testing |
 
 **Mini-plan:** MP-3.4 — can start early (parallel Phase 0.5)
@@ -522,7 +728,7 @@ apps/mobile/src/
 | 6.2 | `POST /statements/generate?period=YYYY-MM` |
 | 6.3 | Review grouped by horse |
 | 6.4 | `POST /statements/:id/finalize` — lock lines |
-| 6.5 | PDF via K8s Job (D-17) or API endpoint |
+| 6.5 | PDF via K8s Job using pdf-lib/pdfkit (D-21); not headless Chromium |
 | 6.6 | `GET /statements/:id.pdf` |
 | 6.7 | CronJob reminder on `billing_cycle_day` — defer |
 
@@ -536,18 +742,19 @@ apps/mobile/src/
 
 | Step | Action |
 |------|--------|
-| 7.1 | PSA restricted on stirrup namespace |
-| 7.2 | NetworkPolicy: ingress→API, API→Postgres only |
+| 7.1 | PSA: default **baseline** (onboarding); optional promotion to restricted if Postgres securityContext already hardened |
+| 7.2 | NetworkPolicy review: ingress→API, API→Postgres only (baseline from MP-0.11) |
 | 7.3 | Resource requests/limits all pods |
 | 7.4 | `/healthz`, `/readyz` (DB ping) |
 | 7.5 | JSON logs → Loki |
 | 7.6 | Prometheus: `care_events_total`, `charge_lines_created`, `sync_batch_duration` |
-| 7.7 | pg_dump CronJob or Velero |
+| 7.7 | pg_dump restore drill (CronJob lives from MP-0.13); Velero optional |
 | 7.8 | Migration Job on deploy |
+| 7.9 | Cloudflare WAF rules + rate limits on `stirrup.reeves.racing` |
 
-**Mini-plans:** MP-7.1, MP-7.2
+**Mini-plans:** MP-7.1, MP-7.2 (restore drill)
 
-**Minimum before pilot with real data:** 7.4 + one successful backup restore test.
+**Minimum before pilot with real data:** 7.4 + one successful backup restore test (pg_dump from MP-0.13).
 
 ---
 
@@ -606,7 +813,8 @@ gantt
 ```
 
 **Parallel tracks:**
-- Phase 7 after Phase 0.7 (Postgres live)
+- Phase 7 after Phase 0.7 (Postgres live); backup CronJob starts Phase 0 (MP-0.13)
+- MP-0.10 Cloudflare Tunnel before mobile field test (Phase 3)
 - Mobile UI mockups during Phase 2 if API contract frozen
 - MP-3.4 EAS setup during Phase 0.5
 - Phases 4–5 swappable by barn urgency
@@ -636,8 +844,12 @@ gantt
 | MP-0.5 | Monorepo scaffold | MP-0.1 | pnpm workspaces |
 | MP-0.6 | Container pipeline | MP-0.5 | arm64 image |
 | MP-0.7 | Postgres | MP-0.4, MP-0.6 | migrations |
-| MP-0.8 | Ingress | MP-0.6 | TLS API |
+| MP-0.8 | Ingress | MP-0.6, MP-0.10 | TLS API via Tunnel |
 | MP-0.9 | Memory bank | — | docs |
+| MP-0.10 | Cloudflare Tunnel | MP-0.2 | public hostname → nginx |
+| MP-0.11 | Platform netpol 5432 | MP-0.2 | API→Postgres egress |
+| MP-0.12 | rook-ceph-block-retain SC | — | Retain RBD class |
+| MP-0.13 | pg_dump CronJob | MP-0.7 | logical backup |
 | MP-1.1a | ERD migrations | MP-0.7 | schema v001 |
 | MP-1.1b | Shared types | MP-1.1a | Zod + contract |
 | MP-1.1c | Seed data | MP-1.1a | demo barn |
@@ -658,10 +870,10 @@ gantt
 | MP-5.1 | Proration lib | MP-1.1b | move-in/out |
 | MP-5.2 | Deposits | MP-5.1 | deposit tracking |
 | MP-6.1 | Statement aggregator | MP-2.2 | monthly close |
-| MP-6.2 | PDF template | MP-6.1 | client PDF |
+| MP-6.2 | PDF template | MP-6.1 | client PDF (pdf-lib Job) |
 | MP-6.3 | Client portal | MP-6.2 | read-only |
 | MP-7.1 | Observability | MP-0.8 | dashboards |
-| MP-7.2 | Backup runbook | MP-0.7 | pg_dump |
+| MP-7.2 | Backup restore drill | MP-0.13 | pg_dump restore test |
 
 ---
 
@@ -669,13 +881,14 @@ gantt
 
 When implementation begins, pull mini-plans in this order:
 
-1. **MP-0.1 + MP-0.5** — Re-seed repo, pnpm monorepo, `homelab-tenant.yaml`
-2. **MP-0.2 → MP-0.8** — Cluster footing (can batch operator steps)
-3. **Resolve D-01 through D-10** — Before MP-1.1a schema freeze
-4. **MP-1.1a + MP-1.2 + MP-1.3** — Schema, auth, admin CRUD
-5. **MP-2.1 + MP-2.2 + MP-2.4** — Care-to-Cash + Quick Charge API proof
-6. **MP-3.4** (parallel) — EAS project setup
-7. **MP-3.3a → MP-3.3c + MP-3.1** — Offline mobile field test
+1. **MP-0.12 + MP-0.10 + MP-0.11** — Platform operator: retain StorageClass, Cloudflare Tunnel, netpol 5432 (can batch)
+2. **MP-0.1 + MP-0.5** — Re-seed repo, pnpm monorepo, `homelab-tenant.yaml`
+3. **MP-0.2 → MP-0.8 + MP-0.13** — Tenant bundle, DNS, Vault ESO, Postgres on retain SC, ingress, pg_dump
+4. **Resolve D-02 through D-10, D-22** — Before MP-1.1a schema freeze (D-01, D-04, D-18–D-21 resolved)
+5. **MP-1.1a + MP-1.2 + MP-1.3** — Schema, JWT auth, admin CRUD
+6. **MP-2.1 + MP-2.2 + MP-2.4** — Care-to-Cash + Quick Charge API proof
+7. **MP-3.4** (parallel) — EAS project setup
+8. **MP-3.3a → MP-3.3c + MP-3.1** — Offline mobile field test (requires MP-0.10 Tunnel)
 
 Do **not** start Phase 3 sync until Phase 2 acceptance test passes.
 

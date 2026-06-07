@@ -16,11 +16,15 @@ Mini-plans spun off from [stirrup-barn-manager-master-plan.md](stirrup-barn-mana
 | MP-0.4 | Vault secrets | MP-0.2 | queued |
 | MP-0.5 | Monorepo scaffold | MP-0.1 | queued |
 | MP-0.6 | Container pipeline | MP-0.5 | queued |
-| MP-0.7 | Postgres on tenant PVC | MP-0.4, MP-0.6 | queued |
-| MP-0.8 | Ingress + TLS | MP-0.6 | queued |
+| MP-0.7 | Postgres on rook-ceph-block-retain | MP-0.4, MP-0.6, MP-0.12 | queued |
+| MP-0.8 | Ingress + Tunnel path | MP-0.6, MP-0.10 | queued |
 | MP-0.9 | Memory bank | — | complete |
+| MP-0.10 | Cloudflare Tunnel (platform) | MP-0.2 | queued |
+| MP-0.11 | Platform netpol 5432 egress | MP-0.2 | queued |
+| MP-0.12 | rook-ceph-block-retain SC (platform) | — | queued |
+| MP-0.13 | pg_dump CronJob | MP-0.7 | queued |
 
-**Phase 0 gate:** `https://stirrup.reeves.racing/healthz` returns OK; Postgres migrations applied; CI green.
+**Phase 0 gate:** `https://stirrup.reeves.racing/healthz` returns OK from LTE via Tunnel; Postgres on retain SC Bound; migrations applied; pg_dump succeeds; CI green.
 
 ---
 
@@ -105,7 +109,7 @@ Mini-plans spun off from [stirrup-barn-manager-master-plan.md](stirrup-barn-mana
 | ID | Name | Depends | Status |
 |----|------|---------|--------|
 | MP-7.1 | Observability | MP-0.8 | queued |
-| MP-7.2 | Backup / restore runbook | MP-0.7 | queued |
+| MP-7.2 | Backup restore drill | MP-0.13 | queued |
 
 ---
 
